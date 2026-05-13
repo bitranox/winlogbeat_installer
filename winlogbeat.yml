@@ -1,0 +1,228 @@
+# ============================== Winlogbeat Base ===============================
+# Security + reliability logging to Graylog (Beats/5044, TLS off)
+#
+# Channel groups, top to bottom:
+#   - Security              -> curated audit event IDs (logon, accounts, AD,
+#                              privileges, services, tasks, shares, Kerberos)
+#   - Application / System  -> program crashes, service & driver errors
+#                              (filtered to critical/error/warning only)
+#   - PowerShell / Defender / Sysmon  -> attacker tradecraft
+#   - TaskScheduler / RDP / WMI / BITS / CodeIntegrity / PrintService / AppLocker
+#                           -> persistence, lateral movement, code integrity
+#   - Setup                 -> servicing / feature install
+# ==============================================================================
+
+winlogbeat.event_logs:
+
+  # --- Security audit log ----------------------------------------------------
+  # Curated IDs covering: account logon (4624/4625/4634/4647/4648/4672/4778/4779),
+  # account/group management (4720..4743, 4756..4758, 4767, 4781),
+  # privilege use (4673/4674), process tracking (4688/4689),
+  # service install (4697), scheduled tasks (4698/4699/4702),
+  # audit policy & log clear (4719/4964/1102),
+  # Kerberos (4768/4769/4771/4772/4776),
+  # local group enumeration / recon (4798/4799),
+  # file share access (5140/5145), credential manager (5379),
+  # object access ACL changes (4670).
+  - name: Security
+    event_id: "1102,4624,4625,4634,4647,4648,4670,4672,4673,4674,4688,4689,4697,4698,4699,4702,4719,4720,4722,4723,4724,4725,4726,4727,4728,4729,4730,4731,4732,4733,4734,4735,4737,4738,4740,4741,4742,4743,4756,4757,4758,4767,4768,4769,4771,4772,4776,4778,4779,4781,4798,4799,4964,5140,5145,5379"
+    ignore_older: 24h
+    level: information
+    tags: ["windows","security"]
+
+  # --- Application log (program errors only) ---------------------------------
+  # Catches .NET runtime crashes, Windows Error Reporting (1000/1001),
+  # Application Hang (1002), MSI install failures, app-specific errors.
+  - name: Application
+    ignore_older: 24h
+    level: "critical, error, warning"
+    tags: ["windows","application","errors"]
+
+  # --- System log (service / driver / kernel errors only) --------------------
+  # Catches service start failures (7000/7001/7011/7034), driver load issues,
+  # disk errors (event 7/11/51 - pre-failure signal), time-sync, boot issues.
+  - name: System
+    ignore_older: 24h
+    level: "critical, error, warning"
+    tags: ["windows","system","errors"]
+
+  # --- PowerShell ------------------------------------------------------------
+  # 4103 module logging, 4104 script block (incl. Warning-level suspicious
+  # script alerts), 4105/4106 start/stop of script block execution.
+  - name: Microsoft-Windows-PowerShell/Operational
+    event_id: "4103,4104,4105,4106"
+    ignore_older: 24h
+    level: "information, warning"
+    tags: ["windows","powershell"]
+
+  # --- Windows Defender ------------------------------------------------------
+  # All levels: detections (Warning), engine errors (Error), updates (Info).
+  - name: Microsoft-Windows-Windows Defender/Operational
+    ignore_older: 24h
+    tags: ["windows","defender"]
+
+  # --- Sysmon ----------------------------------------------------------------
+  # All event IDs - assumes a tuned Sysmon config (e.g. SwiftOnSecurity).
+  - name: Microsoft-Windows-Sysmon/Operational
+    ignore_older: 24h
+    level: information
+    tags: ["windows","sysmon"]
+
+  # --- Task Scheduler --------------------------------------------------------
+  # Complements Security 4698: detail on task registration, run, completion.
+  - name: Microsoft-Windows-TaskScheduler/Operational
+    ignore_older: 24h
+    tags: ["windows","taskscheduler"]
+
+  # --- RDP: local session manager --------------------------------------------
+  # IDs 21 (logon), 22 (shell start), 23 (logoff), 24 (disconnect),
+  # 25 (reconnect). Source for "who used RDP on this box".
+  - name: Microsoft-Windows-TerminalServices-LocalSessionManager/Operational
+    ignore_older: 24h
+    tags: ["windows","rdp","session"]
+
+  # --- RDP: remote connection manager ----------------------------------------
+  # ID 1149 carries the source IP of inbound RDP connection attempts.
+  - name: Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational
+    ignore_older: 24h
+    tags: ["windows","rdp","connection"]
+
+  # --- WMI activity ----------------------------------------------------------
+  # WMI persistence (T1546.003) and lateral movement (T1047).
+  - name: Microsoft-Windows-WMI-Activity/Operational
+    ignore_older: 24h
+    tags: ["windows","wmi"]
+
+  # --- BITS client -----------------------------------------------------------
+  # BITS abuse for download / exfiltration (T1197).
+  - name: Microsoft-Windows-Bits-Client/Operational
+    ignore_older: 24h
+    tags: ["windows","bits"]
+
+  # --- Code Integrity --------------------------------------------------------
+  # Driver / binary signing failures, WDAC violations.
+  - name: Microsoft-Windows-CodeIntegrity/Operational
+    ignore_older: 24h
+    level: "critical, error, warning"
+    tags: ["windows","codeintegrity"]
+
+  # --- Print Service ---------------------------------------------------------
+  # PrintNightmare-class abuse (e.g. ID 316 / 808 - driver load).
+  - name: Microsoft-Windows-PrintService/Operational
+    ignore_older: 24h
+    tags: ["windows","printservice"]
+
+  # --- AppLocker (only emits events when AppLocker is configured) ------------
+  - name: Microsoft-Windows-AppLocker/EXE and DLL
+    ignore_older: 24h
+    tags: ["windows","applocker"]
+
+  - name: Microsoft-Windows-AppLocker/MSI and Script
+    ignore_older: 24h
+    tags: ["windows","applocker"]
+
+  # --- Setup -----------------------------------------------------------------
+  # Servicing / feature install events.
+  - name: Setup
+    ignore_older: 24h
+    level: "critical, error, warning"
+    tags: ["windows","setup"]
+
+# -------------------------- Additional fields for routing ---------------------
+
+fields:
+  environment: "prod"    # e.g. prod/dev/test
+  site: "vienna-dc"      # location
+  shipper: "winlogbeat"  # origin
+fields_under_root: true  # place fields directly at the root level
+
+# --------------------------------- Processors ---------------------------------
+processors:
+  - add_host_metadata: ~
+  - add_cloud_metadata: ~
+
+  # Enrich processes (when PIDs are present in the event)
+  - add_process_metadata:
+      match_pids: ["winlog.event_data.ProcessId", "winlog.event_data.TargetProcessId"]
+      target: process.lookup
+      ignore_missing: true
+
+  # SIDs -> Name/Domain/Type (one block per source field, with *_target)
+  - translate_sid:
+      field: winlog.event_data.SubjectUserSid
+      account_name_target: winlog.event_data.SubjectUserName
+      domain_target:       winlog.event_data.SubjectDomainName
+      account_type_target: winlog.event_data.SubjectUserType
+      ignore_missing: true
+      fail_on_error: false
+
+  - translate_sid:
+      field: winlog.event_data.TargetUserSid
+      account_name_target: winlog.event_data.TargetUserName
+      domain_target:       winlog.event_data.TargetDomainName
+      account_type_target: winlog.event_data.TargetUserType
+      ignore_missing: true
+      fail_on_error: false
+
+  # Reduce noise on Windows clients: drop successful network (LogonType 3)
+  # and service (LogonType 5) logon/logoff pairs - these are mostly SMB browse,
+  # GPO refresh, scheduled tasks running as SYSTEM, etc.
+  # On servers / DCs you usually want LogonType 3 kept - remove these blocks.
+  - drop_event:
+      when:
+        and:
+          - equals: { winlog.event_id: 4624 }
+          - or:
+              - equals: { winlog.event_data.LogonType: "3" }
+              - equals: { winlog.event_data.LogonType: "5" }
+
+  - drop_event:
+      when:
+        and:
+          - equals: { winlog.event_id: 4634 }
+          - or:
+              - equals: { winlog.event_data.LogonType: "3" }
+              - equals: { winlog.event_data.LogonType: "5" }
+
+  # Small mapping for more convenient queries/dashboards
+  - rename:
+      fields:
+        - from: "winlog.computer_name"
+          to:   "host.hostname"
+      ignore_missing: true
+      fail_on_error: false
+
+# ------------------------------- Output -> Graylog ----------------------------
+
+output.logstash:
+  hosts: ["graylog.yourdomain.fqdn:5044"]   # Graylog Beats input
+  # TLS is OFF in your setup -> do NOT set ssl.enabled here
+  loadbalance: true
+  compression_level: 3
+
+# --------------------------------- Logging ------------------------------------
+
+logging.level: info
+logging.to_files: true
+logging.files:
+  # path omitted -> uses --path.logs from the service binPath
+  # (stable under C:\Program Files\Elastic\Beats\logs)
+  name: winlogbeat
+  keepfiles: 7
+  rotateeverybytes: 10485760  # 10 MB
+
+# ------------------------------- Internal queue -------------------------------
+
+queue.mem:
+  events: 4096
+  flush.min_events: 512
+  flush.timeout: 5s
+
+# ------------------------- Index management by Graylog ------------------------
+
+setup.ilm.enabled: false
+setup.template.enabled: false
+
+# --------------------------------- Shutdown -----------------------------------
+
+shutdown_timeout: 10s
