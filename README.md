@@ -51,6 +51,7 @@ This installer breaks that cycle by:
 | `install.ps1`               | The installer / orchestrator. Run elevated.                                                                                                                                                                                                                                                                                                                                                                                |
 | `winlogbeat.yml`            | **Sample** seed config tailored for **Graylog** (Beats input on port 5044, TLS off) and **Windows 11**. Adjust the `output.logstash.hosts` target and event log selection for your environment. Copied to `C:\Program Files\Elastic\Beats\winlogbeat.yml` only on fresh installs (or with `-ForceConfigOverwrite`). To change shipper behavior on a machine that already has it deployed, edit the deployed copy directly. |
 | `Fix-WinlogbeatService.ps1` | Idempotent maintenance script that re-points the service. Deployed alongside the config.                                                                                                                                                                                                                                                                                                                                   |
+| `check_config.ps1`          | Standalone validator. Runs `winlogbeat.exe test config` (and `test output`) against the deployed config — or a path you supply. Read-only, no admin required.                                                                                                                                                                                                                                                              |
 | `README.md`                 | This file.                                                                                                                                                                                                                                                                                                                                                                                                                 |
 
 ## Usage
@@ -238,6 +239,29 @@ Get-ScheduledTaskInfo -TaskName Fix-WinlogbeatService-OnMsiInstall
 # Run the maintenance script manually (idempotent)
 & "C:\Program Files\Elastic\Beats\Fix-WinlogbeatService.ps1"
 ```
+
+### Validating the config (`check_config.ps1`)
+
+`check_config.ps1` runs `winlogbeat.exe test config` and `test output`
+against a config file using the newest installed `winlogbeat.exe`. It uses
+a private temp `--path.data` so it never disturbs the running service's
+registry / lockfile, and it does **not** require admin rights.
+
+```powershell
+# Check the deployed stable config (default)
+.\check_config.ps1
+
+# Check the bundled config in this directory before deploying
+.\check_config.ps1 -Bundled
+
+# Check an arbitrary file
+.\check_config.ps1 -ConfigPath C:\tmp\test.yml
+
+# Skip the output reachability test (doesn't try to talk to Graylog)
+.\check_config.ps1 -SkipOutputTest
+```
+
+Exit code `0` = all checks passed, `1` = one or more failed.
 
 ## Uninstall
 
