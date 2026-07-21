@@ -163,17 +163,35 @@ Write-Step "Registering scheduled task '$TaskName'"
 $action = New-ScheduledTaskAction -Execute "powershell.exe" `
     -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$ScriptDst`""
 
+# Three triggers so a single missed signal can never leave the service broken.
+# All of them run the same idempotent maintenance script, so extra firings are
+# cheap no-ops when nothing changed.
+#
+#   1. MSI event 1033  - fast path: reconfig within ~30s of an upgrade.
+#   2. At startup      - boot backstop: heals after any reboot.
+#   3. Daily 03:00     - catch-all backstop: heals within a day even if the
+#                        event trigger silently missed an upgrade (which is
+#                        exactly how 9.4.2/9.4.3 slipped through originally).
+
+# --- Trigger 1: MSI upgrade event (fast path) ---
 $cls = Get-CimClass -ClassName MSFT_TaskEventTrigger -Namespace Root/Microsoft/Windows/TaskScheduler
-$trigger = New-CimInstance -CimClass $cls -ClientOnly
-$trigger.Enabled = $true
-$trigger.Subscription = @'
+$evtTrigger = New-CimInstance -CimClass $cls -ClientOnly
+$evtTrigger.Enabled = $true
+$evtTrigger.Subscription = @'
 <QueryList>
   <Query Id="0" Path="Application">
     <Select Path="Application">*[System[Provider[@Name='MsiInstaller'] and EventID=1033]]</Select>
   </Query>
 </QueryList>
 '@
-$trigger.Delay = 'PT30S'
+$evtTrigger.Delay = 'PT30S'
+
+# --- Trigger 2: at system startup (boot backstop) ---
+$bootTrigger = New-ScheduledTaskTrigger -AtStartup
+$bootTrigger.Delay = 'PT2M'
+
+# --- Trigger 3: daily (catch-all backstop) ---
+$dailyTrigger = New-ScheduledTaskTrigger -Daily -At '3:00AM'
 
 $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
 
@@ -183,9 +201,9 @@ $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoi
 
 Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
 Register-ScheduledTask -TaskName $TaskName `
-    -Description "Re-points the winlogbeat service at the newest installed Beats version after MSI upgrades." `
-    -Action $action -Trigger $trigger -Principal $principal -Settings $settings | Out-Null
-Write-Ok "Scheduled task registered"
+    -Description "Re-points the winlogbeat service at the newest installed Beats version after MSI upgrades. Self-healing: fires on MSI event 1033, at boot, and daily." `
+    -Action $action -Trigger $evtTrigger, $bootTrigger, $dailyTrigger -Principal $principal -Settings $settings | Out-Null
+Write-Ok "Scheduled task registered (3 triggers: MSI event 1033, at boot, daily 03:00)"
 
 # ---------------------------------------------------------------------------
 # 5. Apply config now (run script once)

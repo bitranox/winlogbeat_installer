@@ -11,10 +11,18 @@ the need to manually copy `winlogbeat.yml` after every MSI upgrade**.
    **Existing configs are preserved** by default - see
    [Config file behavior](#config-file-winlogbeatyml-behavior) below.
 3. Deploys the maintenance script `Fix-WinlogbeatService.ps1` next to it.
-4. Registers a **scheduled task** that fires whenever the MSI installer
-   reports a successful product install (Application log, source `MsiInstaller`,
-   event ID `1033`). The task re-points the service's `binPath` at the stable
-   config and the newest installed version dir.
+4. Registers a **self-healing scheduled task** with **three triggers**, all
+   running the same idempotent maintenance script:
+   - **MSI event 1033** (Application log, source `MsiInstaller`) - the fast
+     path: reconfigs within ~30s of an upgrade.
+   - **At system startup** (+2 min) - boot backstop.
+   - **Daily at 03:00** - catch-all backstop.
+
+   The task re-points the service's `binPath` at the stable config and the
+   newest installed version dir. The two backstops exist because the event
+   trigger alone silently missed two upgrades (9.4.2, 9.4.3), leaving the
+   service pointed at a nonexistent config and stopped - see
+   [Notes / caveats](#notes--caveats).
 5. Runs the maintenance script once to apply the binPath immediately.
 6. If the config file was just (re)deployed, restarts the service so the
    new config is loaded into the running process.
@@ -197,12 +205,18 @@ Once installed, you don't need this installer again to upgrade:
 winget upgrade --id Elastic.Winlogbeat
 ```
 
-Within ~30 seconds the scheduled task fires, runs the maintenance script,
-and the service is back to using the stable config from the new version dir.
-The maintenance script then waits up to 30 s for the service to reach
-`Running`, and **only on success** removes the previous versioned install
-dirs under `C:\Program Files\Elastic\Beats\`. If the new service fails to
-start, the old version dirs are kept for diagnosis / manual rollback.
+Within ~30 seconds the scheduled task fires (MSI event 1033), runs the
+maintenance script, and the service is back to using the stable config from
+the new version dir. The maintenance script then waits up to 30 s for the
+service to reach `Running`, and **only on success** removes the previous
+versioned install dirs under `C:\Program Files\Elastic\Beats\`. If the new
+service fails to start, the old version dirs are kept for diagnosis / manual
+rollback.
+
+If the event trigger ever misses an upgrade, the **boot** and **daily 03:00**
+backstop triggers re-run the same maintenance script and self-heal the
+service - at worst within a day, or on the next reboot - with no manual copy
+of `winlogbeat.yml` ever required.
 
 > **Opt out of automatic cleanup:** the maintenance script also accepts
 > `-KeepOldVersions`. Since the scheduled task invokes the script without
@@ -219,7 +233,7 @@ start, the old version dirs are kept for diagnosis / manual rollback.
 | `C:\Program Files\Elastic\Beats\data\`                     | Stable shipper state (event registry, lockfile) |
 | `C:\Program Files\Elastic\Beats\logs\`                     | Stable beat logs                                |
 | `C:\Program Files\Elastic\Beats\<ver>\winlogbeat\`         | Versioned install dir (managed by winget/MSI)   |
-| Scheduled task `Fix-WinlogbeatService-OnMsiInstall`        | Auto-reconfig trigger                           |
+| Scheduled task `Fix-WinlogbeatService-OnMsiInstall`        | Self-healing auto-reconfig (MSI event + boot + daily) |
 | Service `winlogbeat` (binPath rewritten)                   | Reads stable config                             |
 
 ## Verification
@@ -287,11 +301,31 @@ Remove-Item -Recurse -Force "C:\Program Files\Elastic\Beats\winlogbeat.yml",
   `powershell.exe -File`, which uses Windows PowerShell 5.1. Keep it ASCII-only
   - non-ASCII characters in a UTF-8-without-BOM file will trigger a parser
   error.
+- **binPath is set via a direct registry write, not `sc.exe`.** The maintenance
+  script writes the service `ImagePath` (REG_EXPAND_SZ) directly under
+  `HKLM:\SYSTEM\CurrentControlSet\Services\winlogbeat`. `sc.exe config
+  winlogbeat binPath= "..."` was tried first but fails with exit code **1639**
+  (`ERROR_INVALID_COMMAND_LINE`): the binPath value has embedded quotes around
+  every path and PowerShell 5.1 does not escape them when calling sc.exe, so
+  sc.exe gets a malformed command line. SCM reads `ImagePath` from the registry
+  on next start, so the direct write is equivalent and quote-safe.
 - **Stale version dirs.** `winget`/MSI does not remove old versioned install
   dirs under `C:\Program Files\Elastic\Beats\`. The installer cleans them up
   automatically after a successful verification (pass `-KeepOldVersions` to
   opt out). The maintenance script always picks the highest version that
   matches `^\d+\.\d+\.\d+$`, so cleanup never affects what the service runs.
-- **Scheduled task trigger** fires on **any** MSI install on the system, not
-  just Winlogbeat upgrades. The maintenance script is idempotent: if nothing
-  changed, it's a fast no-op.
+- **Scheduled task triggers.** The MSI event trigger fires on **any** MSI
+  install on the system, not just Winlogbeat upgrades. The maintenance script
+  is idempotent: if nothing changed, it's a fast no-op. In addition to the
+  event trigger there are two backstops - **at boot (+2 min)** and **daily at
+  03:00** - so a missed event can't leave the service down.
+- **Why the backstops exist (2026-07-21).** With only the MSI event trigger,
+  the task fired at the 9.4.1 setup but silently **did not fire** for the
+  9.4.2 or 9.4.3 upgrades. The MSI re-registered the service `binPath` into
+  the versioned dir (`...\9.4.3\winlogbeat\.`), which has no `winlogbeat.yml`,
+  so winlogbeat could not find its config and the service sat **Stopped**.
+  Tell-tale signs: stale `9.4.1`/`9.4.2` dirs never cleaned up, and a service
+  `binPath` lacking the `-c "...\Beats\winlogbeat.yml"` fragment. The boot +
+  daily triggers were added so this self-heals regardless of whether the
+  event trigger fires. To recover an already-broken box, just run the
+  installer again: `.\install.ps1 -SkipWinget`.

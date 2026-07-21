@@ -53,8 +53,17 @@ if ($currentBin -eq $desiredBin) {
     New-Item -ItemType Directory -Force -Path $data, $logs | Out-Null
 
     Stop-Service winlogbeat -ErrorAction SilentlyContinue
-    & sc.exe config winlogbeat binPath= "$desiredBin" | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "sc.exe config failed with exit code $LASTEXITCODE" }
+
+    # Write ImagePath straight to the registry rather than calling
+    # `sc.exe config winlogbeat binPath= "..."`. The binPath value contains
+    # embedded double-quotes around each path, and Windows PowerShell 5.1 does
+    # not escape them when handing the string to sc.exe, so sc.exe receives a
+    # malformed command line and fails with exit code 1639 (ERROR_INVALID_
+    # COMMAND_LINE). SCM reads ImagePath from this key on the next start, so a
+    # direct registry write is equivalent and completely quote-safe.
+    Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\winlogbeat" `
+        -Name ImagePath -Value $desiredBin -Type ExpandString
+
     Start-Service winlogbeat
     Write-Host "winlogbeat reconfigured and started."
 }
